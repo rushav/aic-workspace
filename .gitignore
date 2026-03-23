@@ -1,0 +1,54 @@
+# Environment & Secrets
+.env
+.env.local
+*.pem
+*.key
+credentials.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+*.egg
+*.so
+
+# Pixi
+.pixi/
+
+# Node / Ruflo
+node_modules/
+.claude/
+.claude-flow/
+data/memory/
+*.db
+
+# ROS 2
+log/
+install/
+build/
+
+# Training artifacts
+checkpoints/
+runs/
+wandb/
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.safetensors
+datasets/
+rosbags/
+
+# Results
+aic_results/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
