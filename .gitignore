@@ -52,3 +52,9 @@ aic_results/
 # OS
 .DS_Store
 Thumbs.db
+train-env/
+datasets/
+checkpoints/
+data/
+.pixi/
+node_modules/
