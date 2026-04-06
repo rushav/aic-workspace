@@ -1,14 +1,13 @@
 """
-MyPolicy — perception bridge + approach + insertion with force feedback.
+MyPolicy — perception bridge + vertical descent (CheatCode strategy).
 
 Pipeline:
 1. Move to survey pose, capture image, run heatmap detector
 2. Back-project detected port pixel to 3D, transform to base_link
-3. Compute approach pose (80mm above port along insertion axis)
-4. Smooth interpolation to approach pose (5s, ~20 Hz)
-5. Descent in 0.5mm steps with force monitoring and XY integral correction
-6. Spiral search if contact detected before insertion depth reached
-7. Return True when insertion depth reached or spiral exhausted
+3. Approach: interpolate to port XY, 100mm above port Z (5s)
+4. Vertical descent: decrease Z in 0.5mm steps, XY locked to port position
+5. Descend from z_offset=+100mm to z_offset=-15mm (past port Z)
+6. Stabilize 5s, return True
 
 The detector is a ResNet-34 encoder-decoder (HeatmapDetector) that outputs
 a 2-channel 96x96 heatmap. Soft-argmax extracts sub-pixel (u, v) coordinates
@@ -17,7 +16,6 @@ for each SFP port. Architecture must match train_detector.py exactly.
 
 import numpy as np
 import os
-import math
 
 import torch
 import torch.nn as nn
@@ -25,7 +23,6 @@ import torch.nn.functional as F
 import torchvision.models as models
 import torchvision.transforms.functional as TF
 from torchvision.transforms import Normalize
-
 from aic_model.policy import (
     GetObservationCallback,
     MoveRobotCallback,
@@ -60,9 +57,6 @@ SURVEY_POSE = Pose(
 # Learned from dataset statistics: mean z = 0.326m.
 DEFAULT_DEPTH_Z = 0.33
 
-# Approach offset: how far above the port (along insertion axis) to stop.
-APPROACH_OFFSET_M = 0.08  # 80mm
-
 # Approach interpolation parameters (matches CheatCode's strategy)
 APPROACH_STEPS = 100      # number of interpolation steps
 APPROACH_STEP_DT = 0.05   # seconds per step → 100 * 0.05 = 5.0s total
@@ -70,16 +64,6 @@ APPROACH_STEP_DT = 0.05   # seconds per step → 100 * 0.05 = 5.0s total
 # Descent parameters
 DESCENT_STEP_M = 0.0005         # 0.5mm per step
 DESCENT_STEP_DT = 0.05          # seconds per step (~20 Hz)
-INSERTION_DEPTH_M = 0.030       # 30mm past approach pose = insertion complete
-CONTACT_FORCE_N = 15.0          # force threshold to trigger spiral search
-CLEAR_FORCE_N = 8.0             # force below this means port opening found
-XY_INTEGRAL_GAIN = 0.001        # gain for lateral force integral correction
-XY_INTEGRAL_WINDUP = 0.005      # max accumulated correction (5mm)
-
-# Spiral search parameters
-SPIRAL_PUSH_M = 0.002           # 2mm push during each spiral probe
-SPIRAL_RADII_M = [0.002, 0.004] # two rings: 2mm, 4mm
-SPIRAL_POINTS_PER_RING = 8      # 8 evenly-spaced points per ring
 
 
 # ── Model definition (must match train_detector.py exactly) ──────────────────
@@ -177,27 +161,6 @@ def lerp(a, b, t):
     return a + (b - a) * t
 
 
-def build_insertion_frame(insertion_axis):
-    """Build an orthonormal frame aligned with the insertion axis.
-
-    Returns (x_perp, y_perp, z_ins) where z_ins = insertion_axis (points
-    away from port toward TCP), and x_perp/y_perp span the plane
-    perpendicular to the insertion axis (used for spiral search and
-    lateral force correction).
-    """
-    z_ins = insertion_axis / np.linalg.norm(insertion_axis)
-
-    # Pick a reference vector not parallel to z_ins to cross-product against
-    ref = np.array([0.0, 0.0, 1.0])
-    if abs(np.dot(z_ins, ref)) > 0.9:
-        ref = np.array([1.0, 0.0, 0.0])
-
-    x_perp = np.cross(z_ins, ref)
-    x_perp = x_perp / np.linalg.norm(x_perp)
-    y_perp = np.cross(z_ins, x_perp)
-    y_perp = y_perp / np.linalg.norm(y_perp)
-
-    return x_perp, y_perp, z_ins
 
 
 # ── Policy ───────────────────────────────────────────────────────────────────
@@ -269,18 +232,6 @@ class MyPolicy(Policy):
             return None
         return obs.controller_state.tcp_pose
 
-    def _get_wrench(self, get_observation):
-        """Get the current wrist wrench from the observation.
-
-        Returns:
-            (fx, fy, fz) force vector in the wrench sensor frame, or None.
-        """
-        obs = get_observation()
-        if obs is None:
-            return None
-        w = obs.wrist_wrench.wrench.force
-        return np.array([w.x, w.y, w.z])
-
     def _make_pose(self, position, orientation):
         """Build a geometry_msgs/Pose from a numpy position array and Quaternion."""
         return Pose(
@@ -291,100 +242,6 @@ class MyPolicy(Policy):
             ),
             orientation=orientation,
         )
-
-    # ── Spiral search ────────────────────────────────────────────────────
-
-    def _spiral_search(
-        self,
-        center_pos,
-        orientation,
-        insertion_axis,
-        x_perp,
-        y_perp,
-        move_robot,
-        get_observation,
-    ):
-        """Probe points on concentric rings perpendicular to the insertion axis.
-
-        At each probe point, push SPIRAL_PUSH_M along the insertion axis.
-        If the axial force drops below CLEAR_FORCE_N during the push, the
-        port opening has been found — return the new position to resume
-        descent from.
-
-        Args:
-            center_pos:     numpy (3,) — the XY center in base frame (where
-                            contact was first detected)
-            orientation:    Quaternion — gripper orientation (held fixed)
-            insertion_axis: numpy (3,) unit vector (port → TCP direction)
-            x_perp, y_perp: numpy (3,) orthonormal basis of the perpendicular plane
-            move_robot:     MoveRobotCallback
-            get_observation: GetObservationCallback
-
-        Returns:
-            numpy (3,) — the new descent position if a clear path was found,
-            or None if the full spiral completed without success.
-        """
-        # Descent direction is opposite to insertion_axis
-        descent_dir = -insertion_axis
-
-        for ring_idx, radius in enumerate(SPIRAL_RADII_M):
-            self.get_logger().info(
-                f"Spiral: ring {ring_idx + 1}, radius={radius * 1000:.1f}mm, "
-                f"{SPIRAL_POINTS_PER_RING} points"
-            )
-
-            for pt_idx in range(SPIRAL_POINTS_PER_RING):
-                # Evenly-spaced angle around the ring
-                angle = 2.0 * math.pi * pt_idx / SPIRAL_POINTS_PER_RING
-
-                # Compute the probe position: offset from center in the
-                # perpendicular plane
-                offset = radius * (math.cos(angle) * x_perp + math.sin(angle) * y_perp)
-                probe_pos = center_pos + offset
-
-                # Move to the probe position (laterally, same depth as contact)
-                self.set_pose_target(
-                    move_robot=move_robot,
-                    pose=self._make_pose(probe_pos, orientation),
-                )
-                self.sleep_for(DESCENT_STEP_DT)
-
-                # Attempt a small push along the insertion direction
-                push_steps = int(SPIRAL_PUSH_M / DESCENT_STEP_M)
-                for push_step in range(push_steps):
-                    push_pos = probe_pos + (push_step + 1) * DESCENT_STEP_M * descent_dir
-                    self.set_pose_target(
-                        move_robot=move_robot,
-                        pose=self._make_pose(push_pos, orientation),
-                    )
-                    self.sleep_for(DESCENT_STEP_DT)
-
-                    # Check if force has dropped — meaning we found the opening
-                    force_vec = self._get_wrench(get_observation)
-                    if force_vec is not None:
-                        axial_force = abs(np.dot(force_vec, insertion_axis))
-                        if axial_force < CLEAR_FORCE_N:
-                            self.get_logger().info(
-                                f"Spiral: opening found at ring {ring_idx + 1} "
-                                f"point {pt_idx}, force={axial_force:.1f}N"
-                            )
-                            # Return the position where force dropped —
-                            # descent will resume from here
-                            return push_pos
-
-                # Retract back to contact depth before trying next point
-                self.set_pose_target(
-                    move_robot=move_robot,
-                    pose=self._make_pose(probe_pos, orientation),
-                )
-                self.sleep_for(DESCENT_STEP_DT)
-
-            self.get_logger().info(
-                f"Spiral: ring {ring_idx + 1} complete, no opening found"
-            )
-
-        # Full spiral exhausted without finding the opening
-        return None
 
     # ── Main entry point ─────────────────────────────────────────────────
 
@@ -401,6 +258,14 @@ class MyPolicy(Policy):
         # ── Step 1: Move arm to survey pose ──────────────────────────────
         self.set_pose_target(move_robot=move_robot, pose=SURVEY_POSE)
         self.sleep_for(2.0)
+
+        # Capture the TCP orientation at survey pose — we'll reuse this
+        # for approach and insertion (the gripper is already facing the board).
+        survey_tcp = self._get_tcp_pose(get_observation)
+        if survey_tcp is None:
+            self.get_logger().error("Failed to get TCP pose at survey pose")
+            return False
+        survey_orientation = survey_tcp.orientation
 
         # ── Step 2: Capture image and camera intrinsics ──────────────────
         obs = get_observation()
@@ -486,51 +351,26 @@ class MyPolicy(Policy):
             f"  Base-frame 3D:      ({port_pos_base[0]:.4f}, {port_pos_base[1]:.4f}, {port_pos_base[2]:.4f})"
         )
 
-        # ── Step 6: Compute approach pose ────────────────────────────────
-        send_feedback("Computing approach pose")
-
-        tcp_pose = self._get_tcp_pose(get_observation)
-        if tcp_pose is None:
-            return False
-
-        tcp_pos = np.array([
-            tcp_pose.position.x,
-            tcp_pose.position.y,
-            tcp_pose.position.z,
+        # ── Step 6: Approach — move to port XY, 100mm above port Z ──────
+        # CheatCode strategy: no insertion axis. Go directly above the port
+        # (same XY), then descend vertically in world Z.
+        approach_orientation = survey_orientation
+        approach_pos = np.array([
+            port_pos_base[0],
+            port_pos_base[1],
+            port_pos_base[2] + 0.1,  # 100mm above port Z
         ])
 
+        send_feedback(
+            f"Approach target: XY=({approach_pos[0]:.4f}, {approach_pos[1]:.4f}), "
+            f"Z={approach_pos[2]:.4f} (port Z + 100mm)"
+        )
         self.get_logger().info(
-            f"Current TCP position: x={tcp_pos[0]:.4f} y={tcp_pos[1]:.4f} z={tcp_pos[2]:.4f}"
+            f"Approach target: ({approach_pos[0]:.4f}, {approach_pos[1]:.4f}, {approach_pos[2]:.4f}), "
+            f"port Z={port_pos_base[2]:.4f}"
         )
 
-        # Insertion axis: unit vector from port toward TCP
-        axis_vec = tcp_pos - port_pos_base
-        axis_len = np.linalg.norm(axis_vec)
-        if axis_len < 1e-6:
-            self.get_logger().error("TCP is at port position — cannot compute insertion axis")
-            return False
-        insertion_axis = axis_vec / axis_len
-
-        self.get_logger().info(
-            f"Insertion axis (port→TCP): ({insertion_axis[0]:.4f}, {insertion_axis[1]:.4f}, {insertion_axis[2]:.4f}), "
-            f"distance: {axis_len*1000:.1f}mm"
-        )
-
-        # Build perpendicular frame for spiral search and lateral force
-        x_perp, y_perp, z_ins = build_insertion_frame(insertion_axis)
-
-        # Approach position: port position + 80mm along insertion axis
-        approach_pos = port_pos_base + APPROACH_OFFSET_M * insertion_axis
-        approach_orientation = tcp_pose.orientation
-
-        approach_pose = self._make_pose(approach_pos, approach_orientation)
-
-        self.get_logger().info(
-            f"Approach pose: pos=({approach_pos[0]:.4f}, {approach_pos[1]:.4f}, {approach_pos[2]:.4f}), "
-            f"offset={APPROACH_OFFSET_M*1000:.0f}mm from port"
-        )
-
-        # ── Step 7: Smooth interpolation to approach pose ────────────────
+        # Smooth interpolation from current TCP to approach position (5s)
         send_feedback("Approaching detected port")
 
         start_tcp = self._get_tcp_pose(get_observation)
@@ -557,11 +397,14 @@ class MyPolicy(Policy):
             )
             self.sleep_for(APPROACH_STEP_DT)
 
-        # ── Step 8: Settle at approach pose ──────────────────────────────
-        self.set_pose_target(move_robot=move_robot, pose=approach_pose)
+        # Settle at approach pose
+        self.set_pose_target(
+            move_robot=move_robot,
+            pose=self._make_pose(approach_pos, approach_orientation),
+        )
         self.sleep_for(1.0)
 
-        # ── Step 9: Log approach result ──────────────────────────────────
+        # Log approach result
         final_tcp = self._get_tcp_pose(get_observation)
         if final_tcp is not None:
             final_pos = np.array([
@@ -570,140 +413,53 @@ class MyPolicy(Policy):
                 final_tcp.position.z,
             ])
             pos_error = np.linalg.norm(final_pos - approach_pos)
-            dist_to_port = np.linalg.norm(final_pos - port_pos_base)
-
             self.get_logger().info(
                 f"=== APPROACH COMPLETE ===\n"
-                f"  Target approach:  ({approach_pos[0]:.4f}, {approach_pos[1]:.4f}, {approach_pos[2]:.4f})\n"
-                f"  Actual TCP:       ({final_pos[0]:.4f}, {final_pos[1]:.4f}, {final_pos[2]:.4f})\n"
-                f"  Position error:   {pos_error*1000:.1f}mm\n"
-                f"  Distance to port: {dist_to_port*1000:.1f}mm"
+                f"  Target:  ({approach_pos[0]:.4f}, {approach_pos[1]:.4f}, {approach_pos[2]:.4f})\n"
+                f"  Actual:  ({final_pos[0]:.4f}, {final_pos[1]:.4f}, {final_pos[2]:.4f})\n"
+                f"  Error:   {pos_error*1000:.1f}mm"
             )
 
-        # ── Step 10: Descent with force feedback ─────────────────────────
-        # Move along the insertion axis in 0.5mm steps toward the port.
-        # Descent direction is the negative insertion axis (toward the port).
-        # At each step:
-        #   - Read the FTS wrench
-        #   - Project force onto insertion axis → axial force
-        #   - Project force onto perpendicular plane → lateral force
-        #   - Accumulate lateral force as XY integral correction
-        #   - If axial force exceeds threshold → spiral search
-        #   - Stop when insertion depth reached
-        send_feedback("Inserting — descending with force feedback")
+        # ── Step 7: Vertical descent in world Z ─────────────────────────
+        # Descend from 100mm above port Z to 15mm below port Z.
+        # XY stays locked to port XY. Exactly like CheatCode.
+        send_feedback("Descending vertically toward port")
 
-        descent_dir = -insertion_axis  # toward the port
-        total_steps = int(INSERTION_DEPTH_M / DESCENT_STEP_M)  # 30mm / 0.5mm = 60 steps
-
-        # Current target position starts at the approach pose.
-        # The XY integral correction accumulates lateral offsets.
-        current_target = approach_pos.copy()
-        xy_integrator = np.zeros(3)  # accumulated lateral correction in base frame
+        z_offset = 0.1  # start 100mm above port Z
+        step_count = 0
 
         self.get_logger().info(
-            f"Starting descent: {total_steps} steps, "
-            f"{INSERTION_DEPTH_M*1000:.0f}mm target depth, "
-            f"contact threshold {CONTACT_FORCE_N:.0f}N"
+            f"Starting vertical descent: z_offset 0.1 → -0.015, "
+            f"step={DESCENT_STEP_M*1000:.1f}mm, port_z={port_pos_base[2]:.4f}"
         )
 
-        for step_i in range(total_steps):
-            # Advance one step along the descent direction
-            current_target = current_target + DESCENT_STEP_M * descent_dir
+        while z_offset > -0.015:
+            z_offset -= DESCENT_STEP_M
+            target_z = port_pos_base[2] + z_offset
+            target_pos = np.array([port_pos_base[0], port_pos_base[1], target_z])
 
-            # Apply XY integral correction to the target position.
-            # This nudges the gripper laterally based on accumulated side forces,
-            # helping it find the port opening — same concept as CheatCode's
-            # integral XY correction.
-            corrected_target = current_target + xy_integrator
-
-            # Command the pose
             self.set_pose_target(
                 move_robot=move_robot,
-                pose=self._make_pose(corrected_target, approach_orientation),
+                pose=self._make_pose(target_pos, approach_orientation),
             )
             self.sleep_for(DESCENT_STEP_DT)
 
-            # Read force/torque sensor
-            force_vec = self._get_wrench(get_observation)
-            if force_vec is None:
-                continue
-
-            # Project force onto insertion axis to get axial force.
-            # Positive = pushing against the port surface.
-            axial_force = np.dot(force_vec, insertion_axis)
-
-            # Project force onto the perpendicular plane for lateral correction.
-            # These are the side forces that indicate misalignment.
-            lateral_x = np.dot(force_vec, x_perp)
-            lateral_y = np.dot(force_vec, y_perp)
-
-            # Accumulate lateral integral correction (clamped to prevent windup).
-            # The correction is in the perpendicular plane, expressed in base frame.
-            xy_integrator += XY_INTEGRAL_GAIN * (lateral_x * x_perp + lateral_y * y_perp)
-            xy_integrator = np.clip(xy_integrator, -XY_INTEGRAL_WINDUP, XY_INTEGRAL_WINDUP)
-
-            # Log every 10 steps
-            depth_mm = (step_i + 1) * DESCENT_STEP_M * 1000
-            if step_i % 10 == 0:
+            # Log every 20 steps
+            if step_count % 20 == 0:
+                send_feedback(f"Descent z_offset={z_offset:.4f}, target_z={target_z:.4f}")
                 self.get_logger().info(
-                    f"Descent step {step_i}/{total_steps}: depth={depth_mm:.1f}mm, "
-                    f"axial_F={axial_force:.1f}N, "
-                    f"lateral_F=({lateral_x:.1f}, {lateral_y:.1f})N, "
-                    f"xy_corr=({np.linalg.norm(xy_integrator)*1000:.2f}mm)"
+                    f"Descent step {step_count}: z_offset={z_offset:.4f}, "
+                    f"target_z={target_z:.4f}"
                 )
 
-            # Check if axial force exceeds contact threshold
-            if abs(axial_force) > CONTACT_FORCE_N:
-                self.get_logger().info(
-                    f"Contact detected at step {step_i}, depth={depth_mm:.1f}mm, "
-                    f"axial_F={axial_force:.1f}N — starting spiral search"
-                )
+            step_count += 1
 
-                # ── Step 11: Spiral search ───────────────────────────────
-                # The gripper has hit the surface but hasn't found the port.
-                # Search a spiral pattern in the perpendicular plane to find
-                # the opening, then resume descent.
-                send_feedback("Spiral search — looking for port opening")
-
-                found_pos = self._spiral_search(
-                    center_pos=corrected_target,
-                    orientation=approach_orientation,
-                    insertion_axis=insertion_axis,
-                    x_perp=x_perp,
-                    y_perp=y_perp,
-                    move_robot=move_robot,
-                    get_observation=get_observation,
-                )
-
-                if found_pos is not None:
-                    # Resume descent from the position where force dropped.
-                    # Reset XY integrator since we've physically relocated.
-                    self.get_logger().info(
-                        f"Spiral search succeeded — resuming descent from "
-                        f"({found_pos[0]:.4f}, {found_pos[1]:.4f}, {found_pos[2]:.4f})"
-                    )
-                    current_target = found_pos.copy()
-                    xy_integrator = np.zeros(3)
-                    send_feedback("Inserting — resuming descent")
-                    continue
-                else:
-                    # Full spiral exhausted. Log warning and exit gracefully.
-                    self.get_logger().warn(
-                        "Spiral search exhausted — could not find port opening. "
-                        "Giving up on this trial."
-                    )
-                    send_feedback("Spiral search failed — giving up")
-                    return True
-
-        # ── Step 12: Insertion depth reached ─────────────────────────────
+        # ── Step 8: Stabilize ────────────────────────────────────────────
         self.get_logger().info(
-            f"Insertion depth reached ({INSERTION_DEPTH_M*1000:.0f}mm). "
-            "Waiting for connector to stabilize..."
+            f"Descent complete ({step_count} steps). Stabilizing for 5s..."
         )
         send_feedback("Insertion complete — stabilizing")
-
-        # Hold position and wait for the connector to seat
-        self.sleep_for(3.0)
+        self.sleep_for(5.0)
 
         # Log final state
         final_tcp = self._get_tcp_pose(get_observation)
@@ -711,9 +467,10 @@ class MyPolicy(Policy):
             fpos = np.array([final_tcp.position.x, final_tcp.position.y, final_tcp.position.z])
             self.get_logger().info(
                 f"=== INSERTION COMPLETE ===\n"
-                f"  Final TCP:         ({fpos[0]:.4f}, {fpos[1]:.4f}, {fpos[2]:.4f})\n"
-                f"  Distance to port:  {np.linalg.norm(fpos - port_pos_base)*1000:.1f}mm\n"
-                f"  XY correction:     {np.linalg.norm(xy_integrator)*1000:.2f}mm"
+                f"  Final TCP:        ({fpos[0]:.4f}, {fpos[1]:.4f}, {fpos[2]:.4f})\n"
+                f"  Port position:    ({port_pos_base[0]:.4f}, {port_pos_base[1]:.4f}, {port_pos_base[2]:.4f})\n"
+                f"  XY error:         {np.linalg.norm(fpos[:2] - port_pos_base[:2])*1000:.1f}mm\n"
+                f"  Z below port:     {(port_pos_base[2] - fpos[2])*1000:.1f}mm"
             )
 
         self.get_logger().info("MyPolicy.insert_cable() exiting")
