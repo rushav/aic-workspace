@@ -205,7 +205,7 @@ class DataCollector(Policy):
             port_frames[f"sfp_port_{i}"] = frame
         # SC ports
         for i in range(2):
-            frame = f"task_board/sc_port_{i}/sc_port_{i}_link_entrance"
+            frame = f"task_board/sc_port_{i}/sc_port_base_link_entrance"
             port_frames[f"sc_port_{i}"] = frame
 
         # Capture from the starting position first

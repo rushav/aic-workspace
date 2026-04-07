@@ -1,11 +1,13 @@
 """
-Train a heatmap-based port keypoint detector (v5).
+Train a heatmap-based port keypoint detector (v8 — masked loss, all layers unfrozen).
 
-Key improvements over v4:
-- Combined loss: heatmap MSE + coordinate L1 (via soft-argmax)
-- Frozen early ResNet layers to prevent overfitting on 300 samples
-- Larger sigma (5px on 96x96 grid) for stronger learning signal
-- Stronger augmentation (more dropout, random erasing)
+Each model is a 2-channel detector:
+  --port-type sfp → channels: sfp_port_0, sfp_port_1
+  --port-type sc  → channels: sc_port_0, sc_port_1
+
+Samples are included if they have ANY of the two port keys (not both required).
+Missing channels get zero heatmaps and are masked out of the loss.
+All ResNet layers are unfrozen for full fine-tuning.
 
 Input: 384x384 camera image
 Output: 2-channel heatmap (96x96) → soft-argmax → (u,v) per port
@@ -13,6 +15,7 @@ Output: 2-channel heatmap (96x96) → soft-argmax → (u,v) per port
 Run in train-env: source ~/aic-workspace/train-env/bin/activate
 """
 
+import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -26,7 +29,12 @@ import json, glob, os, numpy as np, random
 IMG_SIZE = 384
 HEATMAP_SIZE = 96
 ORIG_W, ORIG_H = 1152, 1024
-SIGMA = 5.0  # larger sigma = more learning signal
+SIGMA = 5.0
+
+PORT_KEYS = {
+    "sfp": ["sfp_port_0", "sfp_port_1"],
+    "sc": ["sc_port_0", "sc_port_1"],
+}
 
 
 # ── Heatmap utilities ────────────────────────────────────────────────────────
@@ -54,9 +62,10 @@ def soft_argmax_2d(heatmap, temperature=10.0):
 
 # ── Dataset ──────────────────────────────────────────────────────────────────
 class PortDataset(Dataset):
-    def __init__(self, sample_paths, img_size=IMG_SIZE, hm_size=HEATMAP_SIZE,
-                 sigma=SIGMA, augment=False):
+    def __init__(self, sample_paths, port_keys, img_size=IMG_SIZE,
+                 hm_size=HEATMAP_SIZE, sigma=SIGMA, augment=False):
         self.samples = sample_paths
+        self.port_keys = port_keys  # e.g. ["sfp_port_0", "sfp_port_1"]
         self.img_size = img_size
         self.hm_size = hm_size
         self.sigma = sigma
@@ -75,28 +84,40 @@ class PortDataset(Dataset):
         img = Image.open(img_path).convert("RGB")
         orig_w, orig_h = img.size
 
-        p0 = label["ports"]["sfp_port_0"]
-        p1 = label["ports"]["sfp_port_1"]
-        u0, v0 = p0["u"] / orig_w, p0["v"] / orig_h
-        u1, v1 = p1["u"] / orig_w, p1["v"] / orig_h
+        # Extract normalized (u, v) for each port key; missing ports get None
+        raw_uvs = []
+        for key in self.port_keys:
+            if key in label["ports"]:
+                p = label["ports"][key]
+                raw_uvs.append((p["u"] / orig_w, p["v"] / orig_h))
+            else:
+                raw_uvs.append(None)
 
+        # Augmentation — only transform coordinates that exist
         if self.augment:
             img = self.color_jitter(img)
 
             if random.random() < 0.5:
                 img = TF.hflip(img)
-                u0, u1 = 1.0 - u1, 1.0 - u0
-                v0, v1 = v1, v0
+                # Swap port 0 ↔ 1 and mirror u
+                swapped = [None, None]
+                if raw_uvs[1] is not None:
+                    swapped[0] = (1.0 - raw_uvs[1][0], raw_uvs[1][1])
+                if raw_uvs[0] is not None:
+                    swapped[1] = (1.0 - raw_uvs[0][0], raw_uvs[0][1])
+                raw_uvs = swapped
 
             tx = random.uniform(-0.06, 0.06)
             ty = random.uniform(-0.06, 0.06)
             scale = random.uniform(0.88, 1.12)
             img = TF.affine(img, angle=0, translate=[int(tx * orig_w), int(ty * orig_h)],
                             scale=scale, shear=0, interpolation=T.InterpolationMode.BILINEAR)
-            u0 = (u0 - 0.5) * scale + 0.5 + tx
-            v0 = (v0 - 0.5) * scale + 0.5 + ty
-            u1 = (u1 - 0.5) * scale + 0.5 + tx
-            v1 = (v1 - 0.5) * scale + 0.5 + ty
+            for i in range(2):
+                if raw_uvs[i] is not None:
+                    u, v = raw_uvs[i]
+                    u = (u - 0.5) * scale + 0.5 + tx
+                    v = (v - 0.5) * scale + 0.5 + ty
+                    raw_uvs[i] = (u, v)
 
         img = TF.resize(img, [self.img_size, self.img_size])
         img_tensor = TF.to_tensor(img)
@@ -109,12 +130,29 @@ class PortDataset(Dataset):
         if self.augment and random.random() < 0.4:
             img_tensor = T.RandomErasing(p=1.0, scale=(0.02, 0.1))(img_tensor)
 
-        hm0 = make_gaussian_heatmap(u0 * self.hm_size, v0 * self.hm_size, self.hm_size, self.hm_size, self.sigma)
-        hm1 = make_gaussian_heatmap(u1 * self.hm_size, v1 * self.hm_size, self.hm_size, self.hm_size, self.sigma)
-        heatmaps = torch.stack([hm0, hm1], dim=0)
+        # Build heatmaps, coords, and validity mask
+        hm_list = []
+        coords_list = []
+        valid_list = []
 
-        coords = torch.tensor([u0, v0, u1, v1], dtype=torch.float32)
-        return img_tensor, heatmaps, coords
+        for i in range(2):
+            if raw_uvs[i] is not None:
+                u, v = raw_uvs[i]
+                hm_list.append(make_gaussian_heatmap(
+                    u * self.hm_size, v * self.hm_size,
+                    self.hm_size, self.hm_size, self.sigma))
+                coords_list.extend([u, v])
+                valid_list.append(1.0)
+            else:
+                hm_list.append(torch.zeros(self.hm_size, self.hm_size))
+                coords_list.extend([-1.0, -1.0])
+                valid_list.append(0.0)
+
+        heatmaps = torch.stack(hm_list, dim=0)
+        coords = torch.tensor(coords_list, dtype=torch.float32)
+        valid = torch.tensor(valid_list, dtype=torch.float32)
+
+        return img_tensor, heatmaps, coords, valid
 
 
 # ── Model ────────────────────────────────────────────────────────────────────
@@ -129,13 +167,7 @@ class HeatmapDetector(nn.Module):
         self.layer3 = backbone.layer3
         self.layer4 = backbone.layer4
 
-        # Freeze early layers to prevent overfitting
-        for param in self.conv1.parameters():
-            param.requires_grad = False
-        for param in self.layer1.parameters():
-            param.requires_grad = False
-        for param in self.layer2.parameters():
-            param.requires_grad = False
+        # All layers unfrozen — full fine-tuning from pretrained weights
 
         # Decoder
         self.up4 = nn.Sequential(
@@ -171,19 +203,38 @@ class HeatmapDetector(nn.Module):
 
 
 # ── Training ─────────────────────────────────────────────────────────────────
-def train():
+def train(port_type):
+    port_keys = PORT_KEYS[port_type]
+    ckpt_name = f"{port_type}_detector"
+    print(f"Training {port_type.upper()} detector: channels = {port_keys}")
+
     data_dir = os.path.expanduser("~/aic-workspace/datasets/port_detection")
     save_dir = os.path.expanduser("~/aic-workspace/checkpoints")
     os.makedirs(save_dir, exist_ok=True)
 
+    # Survey all samples and print detailed counts
     all_json = sorted(glob.glob(f"{data_dir}/sample_*.json"))
     valid_samples = []
+    has_0 = 0
+    has_1 = 0
+    has_both = 0
     for jp in all_json:
         with open(jp) as f:
             d = json.load(f)
-        if "sfp_port_0" in d["ports"] and "sfp_port_1" in d["ports"]:
+        p0 = port_keys[0] in d["ports"]
+        p1 = port_keys[1] in d["ports"]
+        if p0:
+            has_0 += 1
+        if p1:
+            has_1 += 1
+        if p0 and p1:
+            has_both += 1
+        # Include if ANY port key present
+        if p0 or p1:
             valid_samples.append(jp)
-    print(f"Valid samples: {len(valid_samples)}")
+
+    print(f"{port_type.upper()} samples: {len(valid_samples)} "
+          f"(with {port_keys[0]}: {has_0}, with {port_keys[1]}: {has_1}, with both: {has_both})")
 
     rng = np.random.RandomState(42)
     indices = rng.permutation(len(valid_samples))
@@ -193,8 +244,8 @@ def train():
     val_paths = [valid_samples[i] for i in range(len(valid_samples)) if i in val_idx]
     print(f"Train: {len(train_paths)}, Val: {len(val_paths)}")
 
-    train_set = PortDataset(train_paths, augment=True)
-    val_set = PortDataset(val_paths, augment=False)
+    train_set = PortDataset(train_paths, port_keys, augment=True)
+    val_set = PortDataset(val_paths, port_keys, augment=False)
     train_loader = DataLoader(train_set, batch_size=16, shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_set, batch_size=16, shuffle=False, num_workers=4, pin_memory=True)
 
@@ -203,8 +254,7 @@ def train():
 
     model = HeatmapDetector(num_keypoints=2).to(device)
 
-    # Only optimize unfrozen parameters
-    trainable = [p for p in model.parameters() if p.requires_grad]
+    trainable = list(model.parameters())
     n_total = sum(p.numel() for p in model.parameters())
     n_trainable = sum(p.numel() for p in trainable)
     print(f"Parameters: {n_total:,} total, {n_trainable:,} trainable ({100*n_trainable/n_total:.0f}%)")
@@ -219,22 +269,29 @@ def train():
     for epoch in range(num_epochs):
         model.train()
         train_loss = 0
-        for imgs, heatmaps, coords in train_loader:
-            imgs, heatmaps, coords = imgs.to(device), heatmaps.to(device), coords.to(device)
+        for imgs, heatmaps, coords, valid in train_loader:
+            imgs = imgs.to(device)
+            heatmaps = heatmaps.to(device)
+            coords = coords.to(device)
+            valid = valid.to(device)  # (B, 2)
+
             pred_hm = model(imgs)
 
-            # Combined loss: heatmap MSE + coordinate L1
-            hm_loss = F.mse_loss(pred_hm, heatmaps)
+            # Per-channel masked heatmap MSE
+            hm_diff = (pred_hm - heatmaps) ** 2  # (B, 2, H, W)
+            valid_hw = valid.unsqueeze(-1).unsqueeze(-1)  # (B, 2, 1, 1)
+            n_valid_pixels = valid_hw.sum() * HEATMAP_SIZE * HEATMAP_SIZE
+            hm_loss = (hm_diff * valid_hw).sum() / (n_valid_pixels + 1e-8)
 
-            # Coordinate loss via soft-argmax
+            # Per-channel masked coordinate loss via soft-argmax
             pred_coords = soft_argmax_2d(pred_hm)  # (B, 2, 2)
-            # Convert gt coords to heatmap space
-            gt_hm_coords = torch.stack([
-                coords[:, 0] * HEATMAP_SIZE, coords[:, 1] * HEATMAP_SIZE,  # port 0 x, y
-                coords[:, 2] * HEATMAP_SIZE, coords[:, 3] * HEATMAP_SIZE,  # port 1 x, y
-            ], dim=-1).view(-1, 2, 2)
-
-            coord_loss = F.smooth_l1_loss(pred_coords, gt_hm_coords)
+            gt_hm_coords = coords.view(-1, 2, 2) * HEATMAP_SIZE  # (B, 2, 2)
+            # Zero out invalid gt coords so they don't produce NaN gradients
+            valid_c = valid.unsqueeze(-1)  # (B, 2, 1)
+            gt_hm_coords = gt_hm_coords * valid_c
+            pred_masked = pred_coords * valid_c
+            coord_diff = F.smooth_l1_loss(pred_masked, gt_hm_coords, reduction='none')  # (B, 2, 2)
+            coord_loss = (coord_diff * valid_c).sum() / (valid_c.sum() * 2 + 1e-8)
 
             loss = hm_loss + 0.1 * coord_loss
 
@@ -249,20 +306,32 @@ def train():
         val_loss = 0
         pixel_errors = []
         with torch.no_grad():
-            for imgs, heatmaps, coords in val_loader:
-                imgs, heatmaps, coords = imgs.to(device), heatmaps.to(device), coords.to(device)
+            for imgs, heatmaps, coords, valid in val_loader:
+                imgs = imgs.to(device)
+                heatmaps = heatmaps.to(device)
+                coords = coords.to(device)
+                valid = valid.to(device)
+
                 pred_hm = model(imgs)
-                hm_loss = F.mse_loss(pred_hm, heatmaps)
+
+                valid_hw = valid.unsqueeze(-1).unsqueeze(-1)
+                hm_diff = (pred_hm - heatmaps) ** 2
+                n_valid_pixels = valid_hw.sum() * HEATMAP_SIZE * HEATMAP_SIZE
+                hm_loss = (hm_diff * valid_hw).sum() / (n_valid_pixels + 1e-8)
+
                 pred_c = soft_argmax_2d(pred_hm)
-                gt_c = torch.stack([
-                    coords[:, 0] * HEATMAP_SIZE, coords[:, 1] * HEATMAP_SIZE,
-                    coords[:, 2] * HEATMAP_SIZE, coords[:, 3] * HEATMAP_SIZE,
-                ], dim=-1).view(-1, 2, 2)
-                coord_loss = F.smooth_l1_loss(pred_c, gt_c)
+                gt_c = coords.view(-1, 2, 2) * HEATMAP_SIZE
+                valid_c = valid.unsqueeze(-1)
+                gt_c_masked = gt_c * valid_c
+                pred_c_masked = pred_c * valid_c
+                coord_diff = F.smooth_l1_loss(pred_c_masked, gt_c_masked, reduction='none')
+                coord_loss = (coord_diff * valid_c).sum() / (valid_c.sum() * 2 + 1e-8)
                 val_loss += (hm_loss + 0.1 * coord_loss).item()
 
                 for b in range(imgs.shape[0]):
                     for p in range(2):
+                        if valid[b, p].item() < 0.5:
+                            continue
                         pu = pred_c[b, p, 0].item() / HEATMAP_SIZE * ORIG_W
                         pv = pred_c[b, p, 1].item() / HEATMAP_SIZE * ORIG_H
                         gu = coords[b, p*2].item() * ORIG_W
@@ -283,21 +352,24 @@ def train():
 
         if mean_px < best_val_px:
             best_val_px = mean_px
-            torch.save(model.state_dict(), f"{save_dir}/port_detector_best.pth")
+            torch.save(model.state_dict(), f"{save_dir}/{ckpt_name}_best.pth")
             patience_counter = 0
         else:
             patience_counter += 1
 
-        # Early stopping with generous patience
         if patience_counter >= 80:
             print(f"Early stopping at epoch {epoch}")
             break
 
-    torch.save(model.state_dict(), f"{save_dir}/port_detector_final.pth")
-    print(f"\nTraining complete.")
+    torch.save(model.state_dict(), f"{save_dir}/{ckpt_name}_final.pth")
+    print(f"\nTraining complete ({port_type.upper()}).")
     print(f"Best mean pixel error: {best_val_px:.1f}px")
     print(f"Models saved to {save_dir}/")
 
 
 if __name__ == "__main__":
-    train()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port-type", required=True, choices=["sfp", "sc"],
+                        help="Which port type to train: sfp or sc")
+    args = parser.parse_args()
+    train(args.port_type)

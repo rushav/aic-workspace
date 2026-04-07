@@ -2,16 +2,16 @@
 MyPolicy — perception bridge + vertical descent (CheatCode strategy).
 
 Pipeline:
-1. Move to survey pose, capture image, run heatmap detector
+1. Move to survey pose, capture image, run regression detector
 2. Back-project detected port pixel to 3D, transform to base_link
 3. Approach: interpolate to port XY, 100mm above port Z (5s)
 4. Vertical descent: decrease Z in 0.5mm steps, XY locked to port position
 5. Descend from z_offset=+100mm to z_offset=-15mm (past port Z)
 6. Stabilize 5s, return True
 
-The detector is a ResNet-34 encoder-decoder (HeatmapDetector) that outputs
-a 2-channel 96x96 heatmap. Soft-argmax extracts sub-pixel (u, v) coordinates
-for each SFP port. Architecture must match train_detector.py exactly.
+Four per-port detectors (sfp_port_0, sfp_port_1, sc_port_0, sc_port_1),
+each a ResNet-18 with a regression head predicting (u, v) for one port.
+Architecture matches train_regression_detector.py.
 """
 
 import numpy as np
@@ -19,7 +19,6 @@ import os
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torchvision.models as models
 import torchvision.transforms.functional as TF
 from torchvision.transforms import Normalize
@@ -37,9 +36,8 @@ from tf2_ros import TransformException
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-# Must match train_detector.py exactly
-IMG_SIZE = 384
-HEATMAP_SIZE = 96
+# Must match train_regression_detector.py
+IMG_SIZE = 256
 
 # Original camera resolution (for denormalizing predictions)
 ORIG_W, ORIG_H = 1152, 1024
@@ -66,83 +64,30 @@ DESCENT_STEP_M = 0.0005         # 0.5mm per step
 DESCENT_STEP_DT = 0.05          # seconds per step (~20 Hz)
 
 
-# ── Model definition (must match train_detector.py exactly) ──────────────────
+# ── Model definition (must match train_regression_detector.py exactly) ───────
 
-def soft_argmax_2d(heatmap, temperature=10.0):
-    """Extract (x, y) coordinates from heatmap via differentiable soft-argmax.
+class PortDetector(nn.Module):
+    """ResNet-18 backbone → regression head → (u_norm, v_norm) for ONE port.
 
-    Args:
-        heatmap: (B, C, H, W) tensor — raw heatmap logits from the detector
-        temperature: scaling factor; higher = sharper peak selection
-
-    Returns:
-        (B, C, 2) tensor of (x, y) coordinates in heatmap pixel space [0, H-1]
-    """
-    B, C, H, W = heatmap.shape
-    flat = heatmap.view(B, C, -1)
-    weights = F.softmax(flat * temperature, dim=-1).view(B, C, H, W)
-
-    device = heatmap.device
-    y_coords = torch.arange(H, dtype=torch.float32, device=device).view(1, 1, H, 1)
-    x_coords = torch.arange(W, dtype=torch.float32, device=device).view(1, 1, 1, W)
-
-    x = (weights * x_coords).sum(dim=(2, 3))
-    y = (weights * y_coords).sum(dim=(2, 3))
-    return torch.stack([x, y], dim=-1)  # (B, C, 2)
-
-
-class HeatmapDetector(nn.Module):
-    """ResNet-34 encoder + upsampling decoder → 2-channel heatmap (96x96).
-
-    This is the exact architecture from train_detector.py. The encoder
-    uses pretrained ResNet-34 layers (conv1 through layer4). The decoder
-    upsamples with transposed convolutions and skip connections from
-    the encoder layers.
-
-    Channel 0 = SFP port 0, Channel 1 = SFP port 1.
+    Simple and effective: no heatmaps, no decoder. Directly regresses
+    normalized pixel coordinates for a single port.
     """
 
-    def __init__(self, num_keypoints=2):
+    def __init__(self):
         super().__init__()
-        # Use weights=None since we'll load our own trained weights
-        backbone = models.resnet34(weights=None)
-
-        self.conv1 = nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu, backbone.maxpool)
-        self.layer1 = backbone.layer1
-        self.layer2 = backbone.layer2
-        self.layer3 = backbone.layer3
-        self.layer4 = backbone.layer4
-
-        self.up4 = nn.Sequential(
-            nn.ConvTranspose2d(512, 256, 4, stride=2, padding=1), nn.BatchNorm2d(256), nn.ReLU())
-        self.dec3 = nn.Sequential(
-            nn.Conv2d(512, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(),
-            nn.Dropout2d(0.15))
-        self.up3 = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1), nn.BatchNorm2d(128), nn.ReLU())
-        self.dec2 = nn.Sequential(
-            nn.Conv2d(256, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
-            nn.Dropout2d(0.1))
-        self.up2 = nn.Sequential(
-            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1), nn.BatchNorm2d(64), nn.ReLU())
-        self.dec1 = nn.Sequential(
-            nn.Conv2d(128, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU())
-        self.head = nn.Conv2d(64, num_keypoints, 1)
+        backbone = models.resnet18(weights=None)
+        self.features = nn.Sequential(*list(backbone.children())[:-1])
+        self.head = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 2),  # just u_norm, v_norm
+        )
 
     def forward(self, x):
-        x0 = self.conv1(x)
-        x1 = self.layer1(x0)
-        x2 = self.layer2(x1)
-        x3 = self.layer3(x2)
-        x4 = self.layer4(x3)
-
-        d3 = self.up4(x4)
-        d3 = self.dec3(torch.cat([d3, x3], dim=1))
-        d2 = self.up3(d3)
-        d2 = self.dec2(torch.cat([d2, x2], dim=1))
-        d1 = self.up2(d2)
-        d1 = self.dec1(torch.cat([d1, x1], dim=1))
-        return self.head(d1)
+        feat = self.features(x)
+        return self.head(feat)
 
 
 # ── Utility functions ────────────────────────────────────────────────────────
@@ -169,16 +114,25 @@ class MyPolicy(Policy):
     def __init__(self, parent_node):
         super().__init__(parent_node)
 
-        # ── Load the trained detector ────────────────────────────────────
-        ckpt_path = os.path.expanduser(
-            "~/aic-workspace/checkpoints/port_detector_best.pth"
-        )
-        self.get_logger().info(f"Loading detector from {ckpt_path}")
+        # ── Load all 4 per-port detectors ────────────────────────────────
+        ckpt_dir = os.path.expanduser("~/aic-workspace/checkpoints")
+        model_keys = ["sfp_port_0", "sfp_port_1", "sc_port_0", "sc_port_1"]
 
-        self._model = HeatmapDetector(num_keypoints=2)
-        state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-        self._model.load_state_dict(state_dict)
-        self._model.eval()
+        self._models = {}
+        for key in model_keys:
+            path = os.path.join(ckpt_dir, f"{key}_best.pth")
+            self.get_logger().info(f"Loading detector: {path}")
+            m = PortDetector()
+            m.load_state_dict(
+                torch.load(path, map_location="cpu", weights_only=True))
+            m.eval()
+            self._models[key] = m
+
+        # Convenience aliases
+        self._sfp0_model = self._models["sfp_port_0"]
+        self._sfp1_model = self._models["sfp_port_1"]
+        self._sc0_model = self._models["sc_port_0"]
+        self._sc1_model = self._models["sc_port_1"]
 
         # ImageNet normalization (same as training)
         self._normalize = Normalize(
@@ -186,19 +140,19 @@ class MyPolicy(Policy):
             std=[0.229, 0.224, 0.225],
         )
 
-        self.get_logger().info("Detector loaded successfully")
+        self.get_logger().info("All 4 per-port detectors loaded successfully")
 
     # ── Helper methods ───────────────────────────────────────────────────
 
-    def _run_detector(self, img_rgb_np):
-        """Run the heatmap detector on a raw RGB numpy image.
+    def _run_detector(self, img_rgb_np, model):
+        """Run a single-port regression detector on a raw RGB numpy image.
 
         Args:
             img_rgb_np: (H, W, 3) uint8 numpy array from the camera
+            model: PortDetector regression model (single port, 2 outputs)
 
         Returns:
-            List of (u_px, v_px) tuples in original image coordinates,
-            one per detected port (port 0, port 1).
+            (u_px, v_px) tuple in original image coordinates.
         """
         from PIL import Image as PILImage
 
@@ -210,19 +164,11 @@ class MyPolicy(Policy):
         batch = tensor.unsqueeze(0)
 
         with torch.no_grad():
-            pred_hm = self._model(batch)
+            pred = model(batch)  # (1, 2) → u_norm, v_norm
 
-        pred_coords = soft_argmax_2d(pred_hm)
-
-        results = []
-        for port_idx in range(2):
-            hm_x = pred_coords[0, port_idx, 0].item()
-            hm_y = pred_coords[0, port_idx, 1].item()
-            u_px = hm_x / HEATMAP_SIZE * ORIG_W
-            v_px = hm_y / HEATMAP_SIZE * ORIG_H
-            results.append((u_px, v_px))
-
-        return results
+        u_px = pred[0, 0].item() * ORIG_W
+        v_px = pred[0, 1].item() * ORIG_H
+        return (u_px, v_px)
 
     def _get_tcp_pose(self, get_observation):
         """Get the current TCP pose from controller_state in the observation."""
@@ -290,23 +236,26 @@ class MyPolicy(Policy):
         )
 
         # ── Step 3: Run the detector ─────────────────────────────────────
-        port_pixels = self._run_detector(img_np)
+        # Select the per-port model based on task
+        if task.port_type == 'sfp':
+            if 'port_0' in task.port_name:
+                model = self._sfp0_model
+                port_label = "sfp_port_0"
+            else:
+                model = self._sfp1_model
+                port_label = "sfp_port_1"
+        elif task.port_type == 'sc':
+            if 'sc_port_0' in task.target_module_name:
+                model = self._sc0_model
+                port_label = "sc_port_0"
+            else:
+                model = self._sc1_model
+                port_label = "sc_port_1"
 
-        target_port_idx = 0
-        if "port_1" in task.port_name:
-            target_port_idx = 1
-
-        u_px, v_px = port_pixels[target_port_idx]
+        u_px, v_px = self._run_detector(img_np, model)
 
         self.get_logger().info(
-            f"Detector prediction for {task.port_name} (port {target_port_idx}): "
-            f"pixel=({u_px:.1f}, {v_px:.1f})"
-        )
-
-        other_idx = 1 - target_port_idx
-        ou, ov = port_pixels[other_idx]
-        self.get_logger().info(
-            f"Other port (port {other_idx}): pixel=({ou:.1f}, {ov:.1f})"
+            f"Detector ({port_label}): pixel=({u_px:.1f}, {v_px:.1f})"
         )
 
         # ── Step 4: Back-project pixel to 3D point in camera frame ───────
