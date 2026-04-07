@@ -63,6 +63,12 @@ APPROACH_STEP_DT = 0.05   # seconds per step → 100 * 0.05 = 5.0s total
 DESCENT_STEP_M = 0.0005         # 0.5mm per step
 DESCENT_STEP_DT = 0.05          # seconds per step (~20 Hz)
 
+# Empirical plug-tip-to-TCP offset in world Y (measured with ground_truth:=true)
+# The plug tip is this far ahead of the TCP in the Y direction.
+# To place the plug at the port, shift TCP target backward (negative Y).
+SFP_PLUG_Y_OFFSET = 0.0206   # 20.6mm — consistent across SFP trials
+SC_PLUG_Y_OFFSET = 0.0132    # 13.2mm — from SC trial
+
 
 # ── Model definition (must match train_regression_detector.py exactly) ───────
 
@@ -304,9 +310,22 @@ class MyPolicy(Policy):
         # CheatCode strategy: no insertion axis. Go directly above the port
         # (same XY), then descend vertically in world Z.
         approach_orientation = survey_orientation
+
+        # Apply empirical plug-tip Y offset so the plug tip (not TCP) targets the port
+        if task.port_type == 'sfp':
+            plug_y_offset = SFP_PLUG_Y_OFFSET
+        else:
+            plug_y_offset = SC_PLUG_Y_OFFSET
+
+        corrected_port_y = port_pos_base[1] - plug_y_offset
+        send_feedback(
+            f"Plug Y offset: {plug_y_offset*1000:.1f}mm, "
+            f"corrected port Y: {corrected_port_y:.4f} (was {port_pos_base[1]:.4f})"
+        )
+
         approach_pos = np.array([
             port_pos_base[0],
-            port_pos_base[1],
+            corrected_port_y,
             port_pos_base[2] + 0.1,  # 100mm above port Z
         ])
 
@@ -385,7 +404,7 @@ class MyPolicy(Policy):
         while z_offset > -0.015:
             z_offset -= DESCENT_STEP_M
             target_z = port_pos_base[2] + z_offset
-            target_pos = np.array([port_pos_base[0], port_pos_base[1], target_z])
+            target_pos = np.array([port_pos_base[0], corrected_port_y, target_z])
 
             self.set_pose_target(
                 move_robot=move_robot,
