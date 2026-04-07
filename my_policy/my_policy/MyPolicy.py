@@ -50,10 +50,10 @@ SURVEY_POSE = Pose(
     orientation=Quaternion(x=1.0, y=0.0, z=0.0, w=0.0),
 )
 
-# Default depth estimate (meters) used when back-projecting pixels to 3D.
-# This is the typical camera-to-port distance from the survey pose.
-# Learned from dataset statistics: mean z = 0.326m.
-DEFAULT_DEPTH_Z = 0.33
+# Depth estimates (meters) for back-projecting pixels to 3D, per port type.
+# Camera-to-port distance from the survey pose.
+SFP_DEPTH_Z = 0.33    # SFP ports: mean z in camera frame from training data
+SC_DEPTH_Z = 0.45     # SC ports: mean z in camera frame from training data
 
 # Approach interpolation parameters (matches CheatCode's strategy)
 APPROACH_STEPS = 100      # number of interpolation steps
@@ -265,7 +265,10 @@ class MyPolicy(Policy):
         )
 
         # ── Step 4: Back-project pixel to 3D point in camera frame ───────
-        z_cam = DEFAULT_DEPTH_Z
+        if task.port_type == 'sfp':
+            z_cam = SFP_DEPTH_Z
+        else:
+            z_cam = SC_DEPTH_Z
         x_cam = (u_px - cx) * z_cam / fx
         y_cam = (v_px - cy) * z_cam / fy
 
@@ -388,38 +391,48 @@ class MyPolicy(Policy):
                 f"  Error:   {pos_error*1000:.1f}mm"
             )
 
+        # Use the actual achieved orientation for descent (avoids controller limit violations)
+        descent_orientation = final_tcp.orientation if final_tcp is not None else approach_orientation
+
         # ── Step 7: Vertical descent in world Z ─────────────────────────
-        # Descend from 100mm above port Z to 15mm below port Z.
+        # Descend from 100mm above port Z past the port.
         # XY stays locked to port XY. Exactly like CheatCode.
-        send_feedback("Descending vertically toward port")
+        if task.port_type == 'sfp':
+            descent_z_end = -0.015   # 15mm past port Z
+        else:
+            descent_z_end = -0.10    # 100mm past port Z
+
+        send_feedback(f"Descent: z_offset 0.1 → {descent_z_end}, port_z={port_pos_base[2]:.4f}")
 
         z_offset = 0.1  # start 100mm above port Z
         step_count = 0
+        current_orientation = descent_orientation  # start with approach orientation
 
         self.get_logger().info(
-            f"Starting vertical descent: z_offset 0.1 → -0.015, "
+            f"Starting vertical descent: z_offset 0.1 → {descent_z_end}, "
             f"step={DESCENT_STEP_M*1000:.1f}mm, port_z={port_pos_base[2]:.4f}"
         )
 
-        while z_offset > -0.015:
+        while z_offset > descent_z_end:
             z_offset -= DESCENT_STEP_M
             target_z = port_pos_base[2] + z_offset
             target_pos = np.array([port_pos_base[0], corrected_port_y, target_z])
 
+            # Read current TCP orientation every step — never fight the controller
+            tcp_now = self._get_tcp_pose(get_observation)
+            if tcp_now is not None:
+                current_orientation = tcp_now.orientation
+
             self.set_pose_target(
                 move_robot=move_robot,
-                pose=self._make_pose(target_pos, approach_orientation),
+                pose=self._make_pose(target_pos, current_orientation),
             )
             self.sleep_for(DESCENT_STEP_DT)
 
-            # Log every 20 steps
             if step_count % 20 == 0:
-                send_feedback(f"Descent z_offset={z_offset:.4f}, target_z={target_z:.4f}")
                 self.get_logger().info(
-                    f"Descent step {step_count}: z_offset={z_offset:.4f}, "
-                    f"target_z={target_z:.4f}"
+                    f"Descent step {step_count}: z_offset={z_offset:.4f}, target_z={target_z:.4f}"
                 )
-
             step_count += 1
 
         # ── Step 8: Stabilize ────────────────────────────────────────────
