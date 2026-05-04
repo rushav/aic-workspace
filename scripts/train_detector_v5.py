@@ -155,10 +155,10 @@ class PortDataset(Dataset):
 def train(port_key, save_dir_name="v5"):
     print(f"Training v5 detector for: {port_key}")
 
-    # Use BOTH datasets
+    # Use all available datasets
     data_dirs = [
         os.path.expanduser("~/aic-workspace/datasets/port_detection"),
-        os.path.expanduser("~/aic-workspace/datasets/port_detection_close"),
+        os.path.expanduser("~/aic-workspace/datasets/port_detection_v2"),
     ]
     save_dir = os.path.expanduser(f"~/aic-workspace/checkpoints/{save_dir_name}")
     os.makedirs(save_dir, exist_ok=True)
